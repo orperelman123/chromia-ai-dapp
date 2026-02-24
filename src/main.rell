@@ -3,26 +3,25 @@ module;
 import ai: lib.ai_inference;
 
 // ═══════════════════════════════════════════════════════════════════
-// Chromia Verified AI — On-Chain AI Inference (v11 — Production)
+// Chromia Verified AI — On-Chain AI Inference (v12 — Cached + Enhanced)
 // ═══════════════════════════════════════════════════════════════════
 //
 // AI inference runs directly on the Chromia blockchain via the
 // AI Inference Extension + HybridCompute. No external GPU server.
 //
-// v11 changes (from v10):
-//   - Admin system: designated admin can manage dapp without redeployment
-//   - Configurable knowledge base: update Chromia facts on-chain
-//   - Maintenance/pause mode: admin can pause inference during upgrades
-//   - Model version tracking: every question records which model answered
-//   - Configurable rate limits: admin can tune limits live
-//   - All v10 prompt optimization + v9 security hardening retained
+// v12 changes (from v11):
+//   - On-chain answer caching: repeat questions return instantly (~2s vs ~65s)
+//   - Auto-invalidation: cache clears when knowledge base or model changes
+//   - Cache stats: hit/miss tracking, admin cache clear operation
+//   - Expanded knowledge base: comprehensive Chromia/Rell/ecosystem facts
+//   - All v11 admin + v10 prompt optimization + v9 security retained
 //
 // The AI model is configured in chromia.yml:
 //   ai_inference.model = "Qwen/Qwen2.5-1.5B-Instruct"
 
 // ─── Constants ──────────────────────────────────────────────────
 
-val VERSION = "v11";
+val VERSION = "v12";
 val MAX_PROMPT_LENGTH = 4000;
 val MAX_SESSIONS_PER_USER = 1000;
 val MAX_MESSAGES_PER_SESSION = 500;
@@ -39,15 +38,23 @@ val DEFAULT_ADMIN_PUBKEY = x"02EAF3FAD870778854E397E6F6AAB1FC278E09A16F4DD940D68
 // Admin can update this live via admin_update_knowledge without redeployment.
 
 val DEFAULT_CHROMIA_FACTS = "CHROMIA FACTS (use these when answering Chromia questions): " +
-    "Chromia is a Layer-1 relational blockchain by ChromaWay (Swedish company). " +
-    "It uses PostgreSQL under the hood. Programming language: Rell (compiles to SQL). " +
-    "Consensus: PBFT with elected block producers, ~1s block time. " +
-    "Native token: CHR (used for staking, fees, governance). " +
-    "Each dApp gets its own blockchain. Cross-chain via ICMF. Token standard: FT4. " +
-    "Queries are free (read from local DB); only transactions cost fees. " +
-    "Frontend SDK: postchain-client (npm). " +
-    "Key people: Henrik Hjelte (CEO), Alex Mizrahi (CTO), Or Perelman (Co-founder). " +
-    "Games on Chromia: My Neighbor Alice, Mines of Dalarnia.";
+    "Chromia is a Layer-1 relational blockchain by ChromaWay (Swedish company, founded 2014). " +
+    "It uses PostgreSQL under the hood, making it the first relational blockchain. " +
+    "Programming language: Rell (Relational Language) — compiles to SQL, type-safe, concise syntax similar to Kotlin. " +
+    "Rell features: entities (like SQL tables), operations (write txs), queries (free reads), @-operator for DB queries. " +
+    "Consensus: eBFT (enhanced BFT) with elected block producers, ~1s block time, deterministic finality. " +
+    "Native token: CHR (ERC-20 on Ethereum, also native on Chromia). Used for staking, fees, hosting dapps, governance. " +
+    "Architecture: Each dApp gets its own blockchain (appchain) with dedicated resources. " +
+    "Cross-chain communication via ICMF (Inter-Chain Messaging Facility). " +
+    "Token standard: FT4 — supports fungible and non-fungible tokens, accounts, authentication. " +
+    "Queries are free (read from local PostgreSQL); only operations (writes) cost fees paid in CHR. " +
+    "Frontend SDK: postchain-client (npm/TypeScript). Also available for Unity (C#), Kotlin, Swift. " +
+    "CLI tool: chr (Chromia CLI) — for building, testing, deploying Rell code. " +
+    "Key people: Henrik Hjelte (CEO), Alex Mizrahi (CTO/inventor), Or Perelman (Co-founder/Head of Ecosystem). " +
+    "Games on Chromia: My Neighbor Alice (ALICE), Mines of Dalarnia (DAR), Chain of Alliance, Corite. " +
+    "Chromia Vault: Non-custodial wallet. Chromia Explorer: Block explorer for the network. " +
+    "Staking: CHR holders stake to node providers. Economy pool distributes rewards. " +
+    "Deployment: Dapps deploy to containers on clusters. Testnet and Mainnet available.";
 
 val DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct";
 
@@ -145,6 +152,37 @@ entity user_rate_limit {
     mutable count_in_window: integer;
 }
 
+// ─── Answer Cache ────────────────────────────────────────────────
+// Caches successful answers so repeat questions return instantly.
+// Keyed by normalized (lowercased) prompt + mode.
+
+entity answer_cache {
+    key prompt_normalized: text, mode: text;
+    answer: text;
+    model_name: text;
+    mutable hit_count: integer = 0;
+    created_at: timestamp = op_context.last_block_time;
+}
+
+entity cache_stats {
+    key id: integer;   // always 0 (singleton)
+    mutable hit_count: integer;
+    mutable miss_count: integer;
+    mutable total_entries: integer;
+}
+
+function get_or_create_cache_stats(): cache_stats {
+    var cs = cache_stats @? { .id == 0 };
+    if (cs == null) {
+        cs = create cache_stats(id = 0, hit_count = 0, miss_count = 0, total_entries = 0);
+    }
+    return cs;
+}
+
+function normalize_prompt(prompt: text): text {
+    return prompt.lower_case();
+}
+
 // ─── Rate Limiting Helper ────────────────────────────────────────
 
 function check_rate_limit(pubkey: byte_array) {
@@ -204,15 +242,29 @@ operation ask_question(id: text, prompt: text, mode: text) {
     // Rate limit
     check_rate_limit(asker);
 
-    // Store the question with mode + model version
     val model = if (cfg != null) cfg.model_name else DEFAULT_MODEL_NAME;
-    create question(id = id, asker = asker, prompt = prompt, mode = mode, model_name = model);
-
-    // Update counter
     val c = get_or_create_counter();
     update c ( total_count = c.total_count + 1 );
 
-    // Submit to Chromia's AI inference engine with mode-specific prompt
+    // Cache lookup — return instantly if we have a cached answer
+    val norm = normalize_prompt(prompt);
+    val cached = answer_cache @? { .prompt_normalized == norm, .mode == mode };
+    if (cached != null) {
+        val cs = get_or_create_cache_stats();
+        update cached ( hit_count = cached.hit_count + 1 );
+        update cs ( hit_count = cs.hit_count + 1 );
+        create question(id = id, asker = asker, prompt = prompt, mode = mode, model_name = cached.model_name,
+            answer = cached.answer, answered = true, answered_at = op_context.last_block_time, response_time_ms = 0);
+        update c ( answered_count = c.answered_count + 1 );
+        return;
+    }
+
+    // Cache miss — submit to AI inference
+    val cs = get_or_create_cache_stats();
+    update cs ( miss_count = cs.miss_count + 1 );
+
+    create question(id = id, asker = asker, prompt = prompt, mode = mode, model_name = model);
+
     ai.submit_chat_inference_request(
         id,
         [
@@ -231,17 +283,32 @@ operation ask_question_simple(id: text, prompt: text) {
     require(prompt.size() > 0, "Prompt cannot be empty");
     require(prompt.size() <= MAX_PROMPT_LENGTH, "Prompt too long (max %d chars)".format(MAX_PROMPT_LENGTH));
 
-    // Maintenance mode check
     val cfg = dapp_config @? { .id == 0 };
     require(cfg == null or not cfg.paused, "Service is paused for maintenance");
 
     check_rate_limit(asker);
 
     val model = if (cfg != null) cfg.model_name else DEFAULT_MODEL_NAME;
-    create question(id = id, asker = asker, prompt = prompt, mode = "default", model_name = model);
-
     val c = get_or_create_counter();
     update c ( total_count = c.total_count + 1 );
+
+    // Cache lookup
+    val norm = normalize_prompt(prompt);
+    val cached = answer_cache @? { .prompt_normalized == norm, .mode == "default" };
+    if (cached != null) {
+        val cs = get_or_create_cache_stats();
+        update cached ( hit_count = cached.hit_count + 1 );
+        update cs ( hit_count = cs.hit_count + 1 );
+        create question(id = id, asker = asker, prompt = prompt, mode = "default", model_name = cached.model_name,
+            answer = cached.answer, answered = true, answered_at = op_context.last_block_time, response_time_ms = 0);
+        update c ( answered_count = c.answered_count + 1 );
+        return;
+    }
+
+    val cs = get_or_create_cache_stats();
+    update cs ( miss_count = cs.miss_count + 1 );
+
+    create question(id = id, asker = asker, prompt = prompt, mode = "default", model_name = model);
 
     ai.submit_chat_inference_request(
         id,
@@ -336,6 +403,15 @@ function handle_inference_result(id: text, result: ai.inference_result) {
         if (result.result != null) {
             update q ( answer = result.result, error = "", answered = true, answered_at = now, response_time_ms = response_time );
             update c ( answered_count = c.answered_count + 1, total_response_time_ms = c.total_response_time_ms + response_time );
+
+            // Populate cache for future identical questions
+            val norm = normalize_prompt(q.prompt);
+            val existing_cache = answer_cache @? { .prompt_normalized == norm, .mode == q.mode };
+            if (existing_cache == null) {
+                create answer_cache(prompt_normalized = norm, mode = q.mode, answer = result.result, model_name = q.model_name);
+                val cs = get_or_create_cache_stats();
+                update cs ( total_entries = cs.total_entries + 1 );
+            }
         } else {
             update q ( error = result.error ?: "Unknown error", answered = true, answered_at = now, response_time_ms = response_time );
             update c ( error_count = c.error_count + 1 );
@@ -567,6 +643,7 @@ operation admin_init_config() {
 }
 
 // Update knowledge base (improves model answers without redeployment)
+// Auto-clears cache since answers would differ with new knowledge
 operation admin_update_knowledge(new_knowledge: text) {
     val signer = op_context.get_signers()[0];
     require_admin(signer);
@@ -575,9 +652,15 @@ operation admin_update_knowledge(new_knowledge: text) {
 
     val cfg = dapp_config @ { .id == 0 };
     update cfg ( knowledge_base = new_knowledge );
+
+    // Auto-clear cache — answers will differ with new knowledge
+    delete answer_cache @* {};
+    val cs = get_or_create_cache_stats();
+    update cs ( total_entries = 0 );
 }
 
 // Update model display name (when cluster admin changes model)
+// Auto-clears cache since a different model produces different answers
 operation admin_update_model(new_model_name: text) {
     val signer = op_context.get_signers()[0];
     require_admin(signer);
@@ -585,6 +668,21 @@ operation admin_update_model(new_model_name: text) {
 
     val cfg = dapp_config @ { .id == 0 };
     update cfg ( model_name = new_model_name );
+
+    // Auto-clear cache — different model = different answers
+    delete answer_cache @* {};
+    val cs = get_or_create_cache_stats();
+    update cs ( total_entries = 0 );
+}
+
+// Clear the answer cache manually
+operation admin_clear_cache() {
+    val signer = op_context.get_signers()[0];
+    require_admin(signer);
+
+    delete answer_cache @* {};
+    val cs = get_or_create_cache_stats();
+    update cs ( total_entries = 0, hit_count = 0, miss_count = 0 );
 }
 
 // Pause/unpause the service (maintenance mode)
@@ -647,4 +745,35 @@ query is_admin(pubkey: byte_array): boolean {
     val cfg = dapp_config @? { .id == 0 };
     if (cfg != null) return pubkey == cfg.admin_pubkey;
     return pubkey == DEFAULT_ADMIN_PUBKEY;
+}
+
+// ─── Cache Queries ───────────────────────────────────────────────
+
+query get_cache_stats() {
+    val cs = cache_stats @? { .id == 0 };
+    if (cs == null) return (
+        hit_count = 0,
+        miss_count = 0,
+        total_entries = 0,
+        hit_rate = 0
+    );
+    val total = cs.hit_count + cs.miss_count;
+    return (
+        hit_count = cs.hit_count,
+        miss_count = cs.miss_count,
+        total_entries = cs.total_entries,
+        hit_rate = if (total > 0) cs.hit_count * 100 / total else 0
+    );
+}
+
+query get_cached_answers(max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 50);
+    return answer_cache @* {} (
+        @sort_desc .hit_count,
+        prompt = .prompt_normalized,
+        mode = .mode,
+        answer = .answer,
+        hits = .hit_count,
+        model = .model_name
+    ) limit safe_count;
 }
