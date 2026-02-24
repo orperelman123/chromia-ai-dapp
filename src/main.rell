@@ -1,0 +1,650 @@
+module;
+
+import ai: lib.ai_inference;
+
+// ═══════════════════════════════════════════════════════════════════
+// Chromia Verified AI — On-Chain AI Inference (v11 — Production)
+// ═══════════════════════════════════════════════════════════════════
+//
+// AI inference runs directly on the Chromia blockchain via the
+// AI Inference Extension + HybridCompute. No external GPU server.
+//
+// v11 changes (from v10):
+//   - Admin system: designated admin can manage dapp without redeployment
+//   - Configurable knowledge base: update Chromia facts on-chain
+//   - Maintenance/pause mode: admin can pause inference during upgrades
+//   - Model version tracking: every question records which model answered
+//   - Configurable rate limits: admin can tune limits live
+//   - All v10 prompt optimization + v9 security hardening retained
+//
+// The AI model is configured in chromia.yml:
+//   ai_inference.model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+// ─── Constants ──────────────────────────────────────────────────
+
+val VERSION = "v11";
+val MAX_PROMPT_LENGTH = 4000;
+val MAX_SESSIONS_PER_USER = 1000;
+val MAX_MESSAGES_PER_SESSION = 500;
+val DEFAULT_RATE_LIMIT_WINDOW_MS = 60000;
+val DEFAULT_RATE_LIMIT_MAX = 30;
+val MAX_CONTEXT_MESSAGES = 10;
+
+// Default admin pubkey (deploy keypair) — can be changed via admin_transfer
+val DEFAULT_ADMIN_PUBKEY = x"02EAF3FAD870778854E397E6F6AAB1FC278E09A16F4DD940D68B62CC5416C3F906";
+
+// ─── Chromia Knowledge Base (default — overridden by on-chain config) ──
+// Injected into every system prompt so the 1.5B model gives accurate
+// Chromia answers instead of hallucinating.
+// Admin can update this live via admin_update_knowledge without redeployment.
+
+val DEFAULT_CHROMIA_FACTS = "CHROMIA FACTS (use these when answering Chromia questions): " +
+    "Chromia is a Layer-1 relational blockchain by ChromaWay (Swedish company). " +
+    "It uses PostgreSQL under the hood. Programming language: Rell (compiles to SQL). " +
+    "Consensus: PBFT with elected block producers, ~1s block time. " +
+    "Native token: CHR (used for staking, fees, governance). " +
+    "Each dApp gets its own blockchain. Cross-chain via ICMF. Token standard: FT4. " +
+    "Queries are free (read from local DB); only transactions cost fees. " +
+    "Frontend SDK: postchain-client (npm). " +
+    "Key people: Henrik Hjelte (CEO), Alex Mizrahi (CTO), Or Perelman (Co-founder). " +
+    "Games on Chromia: My Neighbor Alice, Mines of Dalarnia.";
+
+val DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct";
+
+// ─── System Prompts by Mode ─────────────────────────────────────
+// Optimized for Qwen2.5-1.5B: short, direct instructions work best.
+// Knowledge base is read from on-chain config (admin-updatable).
+
+function get_knowledge(): text {
+    val cfg = dapp_config @? { .id == 0 };
+    return if (cfg != null) cfg.knowledge_base else DEFAULT_CHROMIA_FACTS;
+}
+
+function get_system_prompt(mode: text): text {
+    val facts = get_knowledge();
+    val base = when (mode) {
+        "concise" -> "You are a helpful AI assistant on Chromia. " +
+            "RULE: Answer in 1-3 sentences MAX. No filler words. Be direct. " +
+            "Yes/No questions: start with Yes or No. ";
+        "detailed" -> "You are a helpful AI assistant on Chromia. " +
+            "Give thorough answers. Use sections, examples, and context. Be comprehensive. ";
+        "technical" -> "You are a technical AI assistant on Chromia. " +
+            "Be precise. Use correct terminology. Include versions and specs when relevant. ";
+        "creative" -> "You are a creative AI assistant on Chromia. " +
+            "Be engaging and imaginative. Use vivid language and storytelling. ";
+        "code" -> "You are a coding AI assistant on Chromia. " +
+            "Give working code examples. Explain briefly. Mention edge cases. Use modern patterns. ";
+        else -> "You are a helpful AI assistant. Your responses are stored on the Chromia blockchain. " +
+            "Be accurate and clear. Use bullet points when helpful. 2-4 sentences unless more detail is needed. ";
+    };
+    return base + facts;
+}
+
+// Valid modes for validation
+function is_valid_mode(mode: text): boolean {
+    return mode in ["default", "concise", "detailed", "technical", "creative", "code"];
+}
+
+// ─── Entities ────────────────────────────────────────────────────
+
+// ─── Admin / Config Entity ───────────────────────────────────────
+
+entity dapp_config {
+    key id: integer;                   // always 0 (singleton)
+    mutable admin_pubkey: byte_array;  // current admin
+    mutable model_name: text;          // display name of active model
+    mutable knowledge_base: text;      // injected into every system prompt
+    mutable paused: boolean;           // maintenance mode
+    mutable rate_limit_window_ms: integer;
+    mutable rate_limit_max: integer;
+}
+
+entity question {
+    key id: text;
+    index asker: byte_array;
+    prompt: text;
+    mode: text = "default";
+    model_name: text = "Qwen/Qwen2.5-1.5B-Instruct";
+    mutable answer: text = "";
+    mutable error: text = "";
+    mutable answered: boolean = false;
+    mutable response_time_ms: integer = 0;
+    created_at: timestamp = op_context.last_block_time;
+    mutable answered_at: timestamp = 0;
+}
+
+entity chat_session {
+    key session_id: text;
+    owner: byte_array;
+    mode: text = "default";
+    mutable message_count: integer = 0;
+    created_at: timestamp = op_context.last_block_time;
+}
+
+entity chat_message {
+    index chat_session;
+    index position: integer;
+    role: text;
+    content: text;
+    created_at: timestamp = op_context.last_block_time;
+}
+
+// Running counters for O(1) stats
+entity inference_counter {
+    key id: integer;
+    mutable total_count: integer;
+    mutable answered_count: integer;
+    mutable error_count: integer;
+    mutable total_response_time_ms: integer;
+}
+
+// Rate limiting per user
+entity user_rate_limit {
+    key user_pubkey: byte_array;
+    mutable window_start: timestamp;
+    mutable count_in_window: integer;
+}
+
+// ─── Rate Limiting Helper ────────────────────────────────────────
+
+function check_rate_limit(pubkey: byte_array) {
+    val now = op_context.last_block_time;
+    val cfg = dapp_config @? { .id == 0 };
+    val window_ms = if (cfg != null) cfg.rate_limit_window_ms else DEFAULT_RATE_LIMIT_WINDOW_MS;
+    val max_req = if (cfg != null) cfg.rate_limit_max else DEFAULT_RATE_LIMIT_MAX;
+
+    val rate = user_rate_limit @? { .user_pubkey == pubkey };
+    if (rate != null) {
+        val elapsed = now - rate.window_start;
+        if (elapsed > window_ms) {
+            update rate ( window_start = now, count_in_window = 1 );
+        } else {
+            require(rate.count_in_window < max_req, "Rate limit exceeded: max %d per minute".format(max_req));
+            update rate ( count_in_window = rate.count_in_window + 1 );
+        }
+    } else {
+        create user_rate_limit( user_pubkey = pubkey, window_start = now, count_in_window = 1 );
+    }
+}
+
+// ─── Counter Helper ──────────────────────────────────────────────
+
+function get_or_create_counter(): inference_counter {
+    var c = inference_counter @? { .id == 0 };
+    if (c == null) {
+        c = create inference_counter(id = 0, total_count = 0, answered_count = 0, error_count = 0, total_response_time_ms = 0);
+    }
+    return c;
+}
+
+// ─── Operations ──────────────────────────────────────────────────
+
+// Simple ping to verify chain is running
+operation ping(msg: text) {
+    require(msg.size() > 0, "Message required");
+}
+
+query get_ping_test() = "pong";
+
+// Simple one-shot question with mode selection
+operation ask_question(id: text, prompt: text, mode: text) {
+    val asker = op_context.get_signers()[0];
+
+    // Validation
+    require(id.size() >= 4 and id.size() <= 128, "Question ID must be 4-128 chars");
+    require(not id.contains(":"), "Question ID must not contain ':'");
+    require(prompt.size() > 0, "Prompt cannot be empty");
+    require(prompt.size() <= MAX_PROMPT_LENGTH, "Prompt too long (max %d chars)".format(MAX_PROMPT_LENGTH));
+    require(is_valid_mode(mode), "Invalid mode. Use: default, concise, detailed, technical, creative, code");
+
+    // Maintenance mode check
+    val cfg = dapp_config @? { .id == 0 };
+    require(cfg == null or not cfg.paused, "Service is paused for maintenance");
+
+    // Rate limit
+    check_rate_limit(asker);
+
+    // Store the question with mode + model version
+    val model = if (cfg != null) cfg.model_name else DEFAULT_MODEL_NAME;
+    create question(id = id, asker = asker, prompt = prompt, mode = mode, model_name = model);
+
+    // Update counter
+    val c = get_or_create_counter();
+    update c ( total_count = c.total_count + 1 );
+
+    // Submit to Chromia's AI inference engine with mode-specific prompt
+    ai.submit_chat_inference_request(
+        id,
+        [
+            ai.chat_message(role = "system", message = get_system_prompt(mode)),
+            ai.chat_message(role = "user", message = prompt)
+        ]
+    );
+}
+
+// Backward-compatible: ask_question without mode (defaults to "default")
+operation ask_question_simple(id: text, prompt: text) {
+    val asker = op_context.get_signers()[0];
+
+    require(id.size() >= 4 and id.size() <= 128, "Question ID must be 4-128 chars");
+    require(not id.contains(":"), "Question ID must not contain ':'");
+    require(prompt.size() > 0, "Prompt cannot be empty");
+    require(prompt.size() <= MAX_PROMPT_LENGTH, "Prompt too long (max %d chars)".format(MAX_PROMPT_LENGTH));
+
+    // Maintenance mode check
+    val cfg = dapp_config @? { .id == 0 };
+    require(cfg == null or not cfg.paused, "Service is paused for maintenance");
+
+    check_rate_limit(asker);
+
+    val model = if (cfg != null) cfg.model_name else DEFAULT_MODEL_NAME;
+    create question(id = id, asker = asker, prompt = prompt, mode = "default", model_name = model);
+
+    val c = get_or_create_counter();
+    update c ( total_count = c.total_count + 1 );
+
+    ai.submit_chat_inference_request(
+        id,
+        [
+            ai.chat_message(role = "system", message = get_system_prompt("default")),
+            ai.chat_message(role = "user", message = prompt)
+        ]
+    );
+}
+
+// Multi-turn chat with mode selection
+operation send_chat_message(session_id: text, message: text, mode: text) {
+    val sender = op_context.get_signers()[0];
+
+    // Validation
+    require(session_id.size() >= 4 and session_id.size() <= 128, "Session ID must be 4-128 chars");
+    require(message.size() > 0, "Message cannot be empty");
+    require(message.size() <= MAX_PROMPT_LENGTH, "Message too long (max %d chars)".format(MAX_PROMPT_LENGTH));
+    require(is_valid_mode(mode), "Invalid mode. Use: default, concise, detailed, technical, creative, code");
+
+    // Maintenance mode check
+    val cfg = dapp_config @? { .id == 0 };
+    require(cfg == null or not cfg.paused, "Service is paused for maintenance");
+
+    // Rate limit
+    check_rate_limit(sender);
+
+    // Get or create session
+    var sess = chat_session @? { .session_id == session_id };
+    if (sess != null) {
+        require(sess.owner == sender, "Not your session");
+    } else {
+        val user_sessions = (chat_session @* { .owner == sender }).size();
+        require(user_sessions < MAX_SESSIONS_PER_USER, "Max %d sessions per user".format(MAX_SESSIONS_PER_USER));
+        sess = create chat_session(session_id = session_id, owner = sender, mode = mode);
+    }
+
+    require(sess.message_count < MAX_MESSAGES_PER_SESSION, "Max %d messages per session".format(MAX_MESSAGES_PER_SESSION));
+
+    // Store user message
+    val position = sess.message_count;
+    create chat_message(
+        chat_session = sess,
+        position = position,
+        role = "user",
+        content = message
+    );
+    update sess ( message_count = sess.message_count + 1 );
+
+    // Update counter
+    val c = get_or_create_counter();
+    update c ( total_count = c.total_count + 1 );
+
+    // Build full conversation for context
+    val messages = list<ai.chat_message>();
+    messages.add(ai.chat_message(role = "system", message = get_system_prompt(mode)));
+
+    // Include conversation history (last MAX_CONTEXT_MESSAGES for better multi-turn)
+    // Use offset/limit to fetch only what we need instead of loading entire history
+    val total_messages = sess.message_count;
+    val skip = if (total_messages > MAX_CONTEXT_MESSAGES) total_messages - MAX_CONTEXT_MESSAGES else 0;
+    val history = chat_message @* { .chat_session == sess } (
+        @sort .position,
+        role = .role,
+        content = .content
+    ) limit MAX_CONTEXT_MESSAGES offset skip;
+    var i = 0;
+    while (i < history.size()) {
+        messages.add(ai.chat_message(role = history[i].role, message = history[i].content));
+        i += 1;
+    }
+
+    // Submit to Chromia's AI inference engine
+    val request_id = session_id + ":" + position.to_text();
+    ai.submit_chat_inference_request(request_id, messages);
+}
+
+// ─── Inference Result Handler ────────────────────────────────────
+
+@extend(ai.on_inference_result)
+function handle_inference_result(id: text, result: ai.inference_result) {
+    val c = get_or_create_counter();
+    val now = op_context.last_block_time;
+
+    // Handle one-shot questions
+    val q = question @? { .id == id };
+    if (q != null) {
+        // Idempotency guard: skip if already answered (prevents double-counting)
+        if (q.answered) return;
+
+        val response_time = max(0, now - q.created_at);
+        if (result.result != null) {
+            update q ( answer = result.result, error = "", answered = true, answered_at = now, response_time_ms = response_time );
+            update c ( answered_count = c.answered_count + 1, total_response_time_ms = c.total_response_time_ms + response_time );
+        } else {
+            update q ( error = result.error ?: "Unknown error", answered = true, answered_at = now, response_time_ms = response_time );
+            update c ( error_count = c.error_count + 1 );
+        }
+        return;
+    }
+
+    // Handle chat messages
+    if (id.contains(":")) {
+        val parts = id.split(":");
+        if (parts.size() >= 2) {
+            val session_id = parts[0];
+            val expected_position = integer.from_text(parts[1]);
+            val session = chat_session @? { .session_id == session_id };
+            if (session != null) {
+                // Idempotency guard: check if assistant message at this position already exists
+                val existing = chat_message @? { .chat_session == session, .position == expected_position + 1, .role == "assistant" };
+                if (existing != null) return;
+
+                val content = result.result ?: ("Error: " + (result.error ?: "Unknown error"));
+                val position = session.message_count;
+                create chat_message(
+                    chat_session = session,
+                    position = position,
+                    role = "assistant",
+                    content = content
+                );
+                update session ( message_count = session.message_count + 1 );
+
+                if (result.result != null) {
+                    update c ( answered_count = c.answered_count + 1 );
+                } else {
+                    update c ( error_count = c.error_count + 1 );
+                }
+            }
+        }
+    }
+}
+
+// ─── Queries ─────────────────────────────────────────────────────
+
+// Stats with average response time
+query get_stats() {
+    val c = inference_counter @? { .id == 0 };
+    val cfg = dapp_config @? { .id == 0 };
+    val model = if (cfg != null) cfg.model_name else DEFAULT_MODEL_NAME;
+    val paused = if (cfg != null) cfg.paused else false;
+    if (c == null) return (
+        total_questions = 0,
+        answered = 0,
+        errors = 0,
+        success_rate = 0,
+        avg_response_time_ms = 0,
+        model = model,
+        version = VERSION,
+        paused = paused
+    );
+    return (
+        total_questions = c.total_count,
+        answered = c.answered_count,
+        errors = c.error_count,
+        success_rate = if (c.total_count > 0) c.answered_count * 100 / c.total_count else 0,
+        avg_response_time_ms = if (c.answered_count > 0) c.total_response_time_ms / c.answered_count else 0,
+        model = model,
+        version = VERSION,
+        paused = paused
+    );
+}
+
+// Get available modes
+query get_modes() {
+    return [
+        (id = "default", name = "Default", description = "Balanced, well-structured answers"),
+        (id = "concise", name = "Concise", description = "Short and to the point (1-3 sentences)"),
+        (id = "detailed", name = "Detailed", description = "Thorough, comprehensive explanations"),
+        (id = "technical", name = "Technical", description = "Precise, technically accurate answers"),
+        (id = "creative", name = "Creative", description = "Engaging, imaginative responses"),
+        (id = "code", name = "Code", description = "Working code examples with explanations")
+    ];
+}
+
+// Get a single question + answer
+query get_answer(id: text) {
+    val q = question @? { .id == id };
+    if (q == null) return null;
+    return (
+        id = q.id,
+        prompt = q.prompt,
+        answer = q.answer,
+        error = q.error,
+        answered = q.answered,
+        mode = q.mode,
+        response_time_ms = q.response_time_ms,
+        created_at = q.created_at,
+        answered_at = q.answered_at
+    );
+}
+
+// Poll for answer status (for frontend polling)
+query get_question_status(id: text) {
+    val q = question @? { .id == id };
+    if (q == null) return (status = "not_found", answer = "", error = "", mode = "", response_time_ms = 0);
+    if (not q.answered) return (status = "pending", answer = "", error = "", mode = q.mode, response_time_ms = 0);
+    if (q.error.size() > 0) return (status = "error", answer = "", error = q.error, mode = q.mode, response_time_ms = q.response_time_ms);
+    return (status = "answered", answer = q.answer, error = "", mode = q.mode, response_time_ms = q.response_time_ms);
+}
+
+// Get chat history
+query get_chat_history(session_id: text) {
+    val session = chat_session @? { .session_id == session_id };
+    if (session == null) return list<(position: integer, role: text, content: text)>();
+    return chat_message @* { .chat_session == session } (
+        @sort .position,
+        role = .role,
+        content = .content
+    );
+}
+
+// Get paginated chat history
+query get_chat_history_paged(session_id: text, page_offset: integer, max_count: integer) {
+    val session = chat_session @? { .session_id == session_id };
+    if (session == null) return list<(position: integer, role: text, content: text)>();
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 100);
+    val safe_offset = max(page_offset, 0);
+    return chat_message @* { .chat_session == session } (
+        @sort .position,
+        role = .role,
+        content = .content
+    ) limit safe_count offset safe_offset;
+}
+
+// Inference status via the AI library (low-level)
+query get_inference_status(id: text) {
+    val result = ai.fetch_inference_result(id);
+    if (result == null) return (status = "pending", result = "", error = "");
+    if (result.error != null) return (status = "error", result = "", error = result.error);
+    return (status = "completed", result = result.result ?: "", error = "");
+}
+
+// Get recent questions (for explorer page) — now includes mode
+query get_recent_questions(max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 50);
+    return question @* {} (
+        @sort_desc .created_at,
+        id = .id,
+        prompt = .prompt,
+        answer = .answer,
+        answered = .answered,
+        mode = .mode,
+        response_time_ms = .response_time_ms
+    ) limit safe_count;
+}
+
+// Get recent questions with pagination (for explorer page)
+query get_recent_questions_paged(max_count: integer, page_offset: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 50);
+    val safe_offset = max(page_offset, 0);
+    return question @* {} (
+        @sort_desc .created_at,
+        id = .id,
+        prompt = .prompt,
+        answer = .answer,
+        answered = .answered,
+        mode = .mode,
+        response_time_ms = .response_time_ms
+    ) limit safe_count offset safe_offset;
+}
+
+// Get total question count (for pagination) — O(1) via counter
+query get_question_count() {
+    val c = inference_counter @? { .id == 0 };
+    return if (c != null) c.total_count else 0;
+}
+
+// Get user's questions
+query get_my_questions(asker: byte_array, max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 100);
+    return question @* { .asker == asker } (
+        @sort_desc .created_at,
+        id = .id,
+        prompt = .prompt,
+        answer = .answer,
+        answered = .answered,
+        mode = .mode,
+        response_time_ms = .response_time_ms
+    ) limit safe_count;
+}
+
+// Get user's chat sessions
+query get_my_sessions(owner: byte_array, max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 50);
+    return chat_session @* { .owner == owner } (
+        @sort_desc .created_at,
+        session_id = .session_id,
+        message_count = .message_count,
+        mode = .mode
+    ) limit safe_count;
+}
+
+// ─── Admin Helper ────────────────────────────────────────────────
+
+function require_admin(signer: byte_array) {
+    val cfg = dapp_config @? { .id == 0 };
+    if (cfg != null) {
+        require(signer == cfg.admin_pubkey, "Not authorized: admin only");
+    } else {
+        require(signer == DEFAULT_ADMIN_PUBKEY, "Not authorized: admin only");
+    }
+}
+
+// ─── Admin Operations ────────────────────────────────────────────
+
+// Initialize config (first time only, sets defaults)
+operation admin_init_config() {
+    val signer = op_context.get_signers()[0];
+    require(signer == DEFAULT_ADMIN_PUBKEY, "Only default admin can initialize");
+    val existing = dapp_config @? { .id == 0 };
+    require(existing == null, "Config already initialized");
+
+    create dapp_config(
+        id = 0,
+        admin_pubkey = DEFAULT_ADMIN_PUBKEY,
+        model_name = DEFAULT_MODEL_NAME,
+        knowledge_base = DEFAULT_CHROMIA_FACTS,
+        paused = false,
+        rate_limit_window_ms = DEFAULT_RATE_LIMIT_WINDOW_MS,
+        rate_limit_max = DEFAULT_RATE_LIMIT_MAX
+    );
+}
+
+// Update knowledge base (improves model answers without redeployment)
+operation admin_update_knowledge(new_knowledge: text) {
+    val signer = op_context.get_signers()[0];
+    require_admin(signer);
+    require(new_knowledge.size() > 0, "Knowledge base cannot be empty");
+    require(new_knowledge.size() <= 8000, "Knowledge base too long (max 8000 chars)");
+
+    val cfg = dapp_config @ { .id == 0 };
+    update cfg ( knowledge_base = new_knowledge );
+}
+
+// Update model display name (when cluster admin changes model)
+operation admin_update_model(new_model_name: text) {
+    val signer = op_context.get_signers()[0];
+    require_admin(signer);
+    require(new_model_name.size() > 0 and new_model_name.size() <= 200, "Model name must be 1-200 chars");
+
+    val cfg = dapp_config @ { .id == 0 };
+    update cfg ( model_name = new_model_name );
+}
+
+// Pause/unpause the service (maintenance mode)
+operation admin_set_paused(paused: boolean) {
+    val signer = op_context.get_signers()[0];
+    require_admin(signer);
+
+    val cfg = dapp_config @ { .id == 0 };
+    update cfg ( .paused = paused );
+}
+
+// Update rate limits
+operation admin_update_rate_limits(window_ms: integer, max_requests: integer) {
+    val signer = op_context.get_signers()[0];
+    require_admin(signer);
+    require(window_ms >= 1000, "Window must be at least 1 second");
+    require(max_requests >= 1, "Max requests must be at least 1");
+
+    val cfg = dapp_config @ { .id == 0 };
+    update cfg ( rate_limit_window_ms = window_ms, rate_limit_max = max_requests );
+}
+
+// Transfer admin to new pubkey
+operation admin_transfer(new_admin: byte_array) {
+    val signer = op_context.get_signers()[0];
+    require_admin(signer);
+    require(new_admin.size() == 33, "Invalid pubkey (must be 33 bytes compressed)");
+
+    val cfg = dapp_config @ { .id == 0 };
+    update cfg ( admin_pubkey = new_admin );
+}
+
+// ─── Admin Queries ───────────────────────────────────────────────
+
+query get_config() {
+    val cfg = dapp_config @? { .id == 0 };
+    if (cfg == null) return (
+        initialized = false,
+        admin_pubkey = DEFAULT_ADMIN_PUBKEY,
+        model_name = DEFAULT_MODEL_NAME,
+        knowledge_base = DEFAULT_CHROMIA_FACTS,
+        paused = false,
+        rate_limit_window_ms = DEFAULT_RATE_LIMIT_WINDOW_MS,
+        rate_limit_max = DEFAULT_RATE_LIMIT_MAX,
+        version = VERSION
+    );
+    return (
+        initialized = true,
+        admin_pubkey = cfg.admin_pubkey,
+        model_name = cfg.model_name,
+        knowledge_base = cfg.knowledge_base,
+        paused = cfg.paused,
+        rate_limit_window_ms = cfg.rate_limit_window_ms,
+        rate_limit_max = cfg.rate_limit_max,
+        version = VERSION
+    );
+}
+
+query is_admin(pubkey: byte_array): boolean {
+    val cfg = dapp_config @? { .id == 0 };
+    if (cfg != null) return pubkey == cfg.admin_pubkey;
+    return pubkey == DEFAULT_ADMIN_PUBKEY;
+}

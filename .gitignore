@@ -1,0 +1,14 @@
+# Secrets
+*.secret
+deploy.secret
+keypair.secret
+
+# Build artifacts
+build/
+node_modules/
+nul
+
+# IDE
+.idea/
+.vscode/
+*.swp

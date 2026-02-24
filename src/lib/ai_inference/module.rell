@@ -1,0 +1,115 @@
+module;
+
+import hc: ^.hybridcompute;
+
+struct chat_message {
+    role: text;
+    message: text;
+}
+
+struct request {
+    prompt: text?;
+    messages: list<chat_message>?;
+    stop: text? = null;
+}
+
+struct response {
+    prompt_tokens: list<integer>;
+    text_tokens: list<integer>;
+    text;
+}
+
+// TODO need something to force generation of code for the structs
+query ai_bogus(request): response = response(prompt_tokens = [], text_tokens = [], text = "bogus");
+
+val my_type = "ai_inference";
+
+@extend(hc.on_compute_result)
+function (id: text, type: text, result: hc.compute_result) {
+    if (type != my_type) return;
+
+    on_inference_result(id, if (result.result != null)
+        inference_result(
+            result = response.from_gtv_pretty(result.result).text,
+            error = null,
+            tx_rid = result.tx_rid,
+            op_index = result.op_index
+        )
+     else
+        inference_result(
+            result = null,
+            error = result.error,
+            tx_rid = result.tx_rid,
+            op_index = result.op_index
+        )
+    );
+}
+
+/**
+ * Submits an inference request.
+ * 
+ * @param id A unique identifier for the inference request.
+ * @param prompt The prompt to generate text for.
+ * @param stop a sequence where it will stop generating further tokens, the returned text will not contain the stop sequence.
+ *        Or `null` to generate exactly `max_completion_tokens` tokens.
+ */
+function submit_inference_request(id: text, prompt: text, stop: text? = null) {
+    hc.submit_compute_request(id, my_type, request(prompt, messages = null, stop = stop).to_gtv_pretty());
+}
+
+/**
+ * Submits an chat inference request.
+ *
+ * @param id A unique identifier for the inference request.
+ * @param messages A list of messages comprising the conversation so far.
+ */
+function submit_chat_inference_request(id: text, messages: list<chat_message>) {
+    hc.submit_compute_request(id, my_type, request(prompt = null, messages, stop = null).to_gtv_pretty());
+}
+
+struct inference_result {
+    /** The result of the inference, or null if an error occurred. */
+    result: text?;
+
+    /** An error message if the inference failed, or null if no error occurred. */
+    error: text?;
+
+    /** RID of the transaction where the result was reported. */
+    tx_rid: byte_array;
+
+    /** Index of the operation where the result was reported. */
+    op_index: integer;
+}
+
+/**
+ * Fetches the result of a previously submitted inference request.
+ *
+ * @param id The identifier of the inference request for which the result is being fetched.
+ * @return The result, or `null` if not ready yet
+ */
+function fetch_inference_result(id: text): inference_result? {
+    val result = hc.fetch_compute_result(id);
+    if (result == null) return null;
+    return if (result.result != null)
+        inference_result(
+            result = response.from_gtv_pretty(result.result).text,
+            error = null,
+            tx_rid = result.tx_rid,
+            op_index = result.op_index
+        )
+     else
+        inference_result(
+            result = null,
+            error = result.error,
+            tx_rid = result.tx_rid,
+            op_index = result.op_index
+        );
+}
+
+/**
+ * Called when an inference is finished, successfully or failed.
+ *
+ * @param id The identifier of the inference request
+ * @param inference_result The result
+ */
+@extendable function on_inference_result(id: text, inference_result) {}

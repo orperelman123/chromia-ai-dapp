@@ -1,0 +1,169 @@
+@mount('hc')
+module;
+
+enum state {
+    NEW,
+    TAKEN,
+    COMPUTED,
+    FAILED,
+}
+
+entity computation {
+    key id: text;
+    index mutable state;
+    type: text;
+    input: byte_array;
+    mutable output: byte_array;
+    mutable error: text;
+    mutable result_tx_rid: byte_array = x"";
+    mutable result_op_index: integer = -1;
+    index mutable taken_timestamp: timestamp = 0;
+    mutable processed_by: pubkey = x"";
+}
+
+struct compute_request {
+    id: text;
+    type: text;
+    input: gtv;
+    taken_timestamp: timestamp;
+    processed_by: pubkey;
+    state;
+}
+
+query get_requests(): list<compute_request> =
+        computation @* { .state == state.NEW } ( compute_request (.id, .type, gtv.from_bytes(.input), .taken_timestamp, .processed_by, .state) );
+
+query get_taken_requests(): list<compute_request> =
+        computation @* { .state == state.TAKEN } ( compute_request (.id, .type, gtv.from_bytes(.input), .taken_timestamp, .processed_by, .state) );
+
+query get_request(id: text): compute_request? =
+        computation @? { .id == id } ( compute_request (.id, .type, gtv.from_bytes(.input), .taken_timestamp, .processed_by, .state) );
+
+query get_taken_request(id: text): compute_request? =
+        computation @? { .id == id, .state == state.TAKEN } ( compute_request (.id, .type, gtv.from_bytes(.input), .taken_timestamp, .processed_by, .state) );
+
+@mount('__hc.')
+operation request_taken(id: text, type: text, processed_by: byte_array, signature_data: byte_array) {
+    request_taken_impl(id, type, processed_by);
+}
+
+@mount('__hc.')
+operation response(id: text, type: text, input: gtv, output: gtv, signature_subject_id: byte_array, signature_data: byte_array) {
+    response_impl(id, type, input, output);
+}
+
+@mount('__hc.')
+operation failure(id: text, type: text, input: gtv, error: text, signature_subject_id: byte_array, signature_data: byte_array) {
+    failure_impl(id, type, input, error);
+}
+
+@mount('__hc.')
+operation cluster_timeout(id: text, type: text, input: gtv) {
+    failure_impl(id, type, input, "Cluster timeout.");
+}
+
+function request_taken_impl(id: text, type: text, processed_by: byte_array) {
+    val computation = require(computation @? { id }, "No computation with id <%s>".format(id));
+    require(computation.state == state.NEW, "Computation <%s> must be NEW, but is %s".format(id, computation.state));
+    require(computation.type == type, "Computation <%s> must have type <%s>".format(id, computation.type));
+    computation.state = state.TAKEN;
+    computation.taken_timestamp = op_context.last_block_time;
+    computation.processed_by = processed_by;
+}
+
+function response_impl(id: text, type: text, input: gtv, output: gtv) {
+    val computation = require(computation @? { id }, "No computation with id <%s>".format(id));
+    require(computation.state == state.TAKEN, "Computation <%s> must be TAKEN, but is %s".format(id, computation.state));
+    require(computation.type == type, "Computation <%s> must have type <%s>".format(id, computation.type));
+    require(computation.input == input.to_bytes(), "Computation <%s> input mismatch".format(id));
+    computation.state = state.COMPUTED;
+    computation.output = output.to_bytes();
+    computation.result_tx_rid = op_context.transaction.tx_rid;
+    computation.result_op_index = op_context.op_index;
+
+    on_compute_result(id, type, compute_result(
+        result = output,
+        error = null,
+        tx_rid = op_context.transaction.tx_rid,
+        op_index = op_context.op_index
+    ));
+}
+
+function failure_impl(id: text, type: text, input: gtv, error: text) {
+    val computation = require(computation @? { id }, "No computation with id <%s>".format(id));
+    require(computation.state == state.TAKEN, "Computation <%s> must be TAKEN, but is %s".format(id, computation.state));
+    require(computation.type == type, "Computation <%s> must have type <%s>".format(id, computation.type));
+    require(computation.input == input.to_bytes(), "Computation <%s> input mismatch".format(id));
+    computation.state = state.FAILED;
+    computation.error = error;
+    computation.result_tx_rid = op_context.transaction.tx_rid;
+    computation.result_op_index = op_context.op_index;
+
+    on_compute_result(id, type, compute_result(
+        result = null,
+        error = error,
+        tx_rid = op_context.transaction.tx_rid,
+        op_index = op_context.op_index
+    ));
+}
+
+/**
+ * Submits a compute request.
+ *
+ * @param id A unique identifier for the compute request.
+ * @param type Which engine to use
+ * @param input Input to the compute
+ */
+function submit_compute_request(id: text, type: text, input: gtv) {
+    create computation ( id, state.NEW, type, input = input.to_bytes(), output = x"", error = "",
+        result_tx_rid = x"", result_op_index = -1 );
+}
+
+struct compute_result {
+    /** The result of the computation, or null if an error occurred. */
+    result: gtv?;
+
+    /** An error message if the computation failed, or null if no error occurred. */
+    error: text?;
+
+    /** RID of the transaction where the result was reported. */
+    tx_rid: byte_array;
+
+    /** Index of the operation where the result was reported. */
+    op_index: integer;
+}
+
+/**
+ * Fetches the result of a previously submitted compute request.
+ *
+ * @param id The identifier of the compute request for which the result is being fetched
+ * @return The result, or `null` if not ready yet
+ */
+function fetch_compute_result(id: text): compute_result? {
+    val computation = require(computation @? { id }, "No computation with id <%s>".format(id));
+    if (computation.state == state.COMPUTED) {
+        return compute_result(
+            result = gtv.from_bytes(computation.output),
+            error = null,
+            tx_rid = computation.result_tx_rid,
+            op_index = computation.result_op_index
+        );
+    } else if (computation.state == state.FAILED) {
+        return compute_result(
+            result = null,
+            error = computation.error,
+            tx_rid = computation.result_tx_rid,
+            op_index = computation.result_op_index
+        );
+    } else {
+        return null;
+    }
+}
+
+/**
+ * Called when a computation is finished, successfully or failed.
+ *
+ * @param id The identifier of the compute request
+ * @param compute_result  The result
+ */
+@extendable function on_compute_result(id: text, type: text, compute_result) {}

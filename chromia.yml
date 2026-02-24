@@ -1,0 +1,37 @@
+blockchains:
+  verified_ai_v11:
+    module: main
+    config:
+      sync_ext:
+        - "net.postchain.hybridcompute.HybridComputeSynchronizationInfrastructureExtension"
+      gtx:
+        modules:
+          - "net.postchain.hybridcompute.HybridComputeGTXModule"
+      hybridcompute:
+        engine: "net.postchain.gtx.extensions.ai_inference.AiInferenceComputeEngine"
+      ai_inference:
+        model: "Qwen/Qwen2.5-1.5B-Instruct"
+        inference_timeout_seconds: 60
+        verification_timeout_seconds: 10
+        max_completion_tokens: 1024
+
+compile:
+  rellVersion: 0.14.15
+
+database:
+  schema: schema_verified_ai_v11
+
+libs:
+  com.chromia.hybridcompute:
+    version: 3.35.4
+  com.chromia.ai_inference:
+    version: 0.4.0
+
+# ─── Deployment ────────────────────────────────────────────────
+deployments:
+  testnet:
+    brid: x"6F1B061C633A992BF195850BF5AA1B6F887AEE01BB3F51251C230930FB792A92"
+    url: https://node0.testnet.chromia.com:7740
+    container: 7675ac10e0861f4cb2b43ecc3f4302131377755f460674a4bfd03146e64dd1f9
+    chains:
+      verified_ai_v11: x"42D870B056261B781F52FA178F95B8FE0513EDD5044A236F845844C859CAE3E6"
