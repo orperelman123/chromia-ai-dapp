@@ -37,24 +37,14 @@ val DEFAULT_ADMIN_PUBKEY = x"02EAF3FAD870778854E397E6F6AAB1FC278E09A16F4DD940D68
 // Chromia answers instead of hallucinating.
 // Admin can update this live via admin_update_knowledge without redeployment.
 
-val DEFAULT_CHROMIA_FACTS = "CHROMIA FACTS (use these when answering Chromia questions): " +
-    "Chromia is a Layer-1 relational blockchain by ChromaWay (Swedish company, founded 2014). " +
-    "It uses PostgreSQL under the hood, making it the first relational blockchain. " +
-    "Programming language: Rell (Relational Language) — compiles to SQL, type-safe, concise syntax similar to Kotlin. " +
-    "Rell features: entities (like SQL tables), operations (write txs), queries (free reads), @-operator for DB queries. " +
-    "Consensus: eBFT (enhanced BFT) with elected block producers, ~1s block time, deterministic finality. " +
-    "Native token: CHR (ERC-20 on Ethereum, also native on Chromia). Used for staking, fees, hosting dapps, governance. " +
-    "Architecture: Each dApp gets its own blockchain (appchain) with dedicated resources. " +
-    "Cross-chain communication via ICMF (Inter-Chain Messaging Facility). " +
-    "Token standard: FT4 — supports fungible and non-fungible tokens, accounts, authentication. " +
-    "Queries are free (read from local PostgreSQL); only operations (writes) cost fees paid in CHR. " +
-    "Frontend SDK: postchain-client (npm/TypeScript). Also available for Unity (C#), Kotlin, Swift. " +
-    "CLI tool: chr (Chromia CLI) — for building, testing, deploying Rell code. " +
-    "Key people: Henrik Hjelte (CEO), Alex Mizrahi (CTO/inventor), Or Perelman (Co-founder/Head of Ecosystem). " +
-    "Games on Chromia: My Neighbor Alice (ALICE), Mines of Dalarnia (DAR), Chain of Alliance, Corite. " +
-    "Chromia Vault: Non-custodial wallet. Chromia Explorer: Block explorer for the network. " +
-    "Staking: CHR holders stake to node providers. Economy pool distributes rewards. " +
-    "Deployment: Dapps deploy to containers on clusters. Testnet and Mainnet available.";
+val DEFAULT_CHROMIA_FACTS = "FACTS: " +
+    "Chromia=L1 relational blockchain by ChromaWay (Sweden,2014). Uses PostgreSQL. " +
+    "Lang=Rell, compiles to SQL, Kotlin-like. Entities/operations/queries/@-operator. " +
+    "Consensus=eBFT, ~1s blocks. Token=CHR (staking/fees/governance). " +
+    "Each dApp=own chain. Cross-chain=ICMF. Token std=FT4. " +
+    "Queries=free. Writes=CHR fees. SDK=postchain-client. CLI=chr. " +
+    "People: Henrik Hjelte(CEO), Alex Mizrahi(CTO), Or Perelman(Co-founder). " +
+    "Games: My Neighbor Alice, Mines of Dalarnia.";
 
 val DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct";
 
@@ -70,19 +60,12 @@ function get_knowledge(): text {
 function get_system_prompt(mode: text): text {
     val facts = get_knowledge();
     val base = when (mode) {
-        "concise" -> "You are a helpful AI assistant on Chromia. " +
-            "RULE: Answer in 1-3 sentences MAX. No filler words. Be direct. " +
-            "Yes/No questions: start with Yes or No. ";
-        "detailed" -> "You are a helpful AI assistant on Chromia. " +
-            "Give thorough answers. Use sections, examples, and context. Be comprehensive. ";
-        "technical" -> "You are a technical AI assistant on Chromia. " +
-            "Be precise. Use correct terminology. Include versions and specs when relevant. ";
-        "creative" -> "You are a creative AI assistant on Chromia. " +
-            "Be engaging and imaginative. Use vivid language and storytelling. ";
-        "code" -> "You are a coding AI assistant on Chromia. " +
-            "Give working code examples. Explain briefly. Mention edge cases. Use modern patterns. ";
-        else -> "You are a helpful AI assistant. Your responses are stored on the Chromia blockchain. " +
-            "Be accurate and clear. Use bullet points when helpful. 2-4 sentences unless more detail is needed. ";
+        "concise" -> "AI on Chromia. 1-3 sentences MAX. Direct. ";
+        "detailed" -> "AI on Chromia. Thorough with sections and examples. ";
+        "technical" -> "Technical AI on Chromia. Precise terminology. ";
+        "creative" -> "Creative AI on Chromia. Engaging and vivid. ";
+        "code" -> "Coding AI on Chromia. Working code + brief explanation. ";
+        else -> "AI on Chromia blockchain. Accurate, clear, 2-4 sentences. ";
     };
     return base + facts;
 }
