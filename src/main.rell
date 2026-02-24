@@ -37,14 +37,7 @@ val DEFAULT_ADMIN_PUBKEY = x"02EAF3FAD870778854E397E6F6AAB1FC278E09A16F4DD940D68
 // Chromia answers instead of hallucinating.
 // Admin can update this live via admin_update_knowledge without redeployment.
 
-val DEFAULT_CHROMIA_FACTS = "FACTS: " +
-    "Chromia=L1 relational blockchain by ChromaWay (Sweden,2014). Uses PostgreSQL. " +
-    "Lang=Rell, compiles to SQL, Kotlin-like. Entities/operations/queries/@-operator. " +
-    "Consensus=eBFT, ~1s blocks. Token=CHR (staking/fees/governance). " +
-    "Each dApp=own chain. Cross-chain=ICMF. Token std=FT4. " +
-    "Queries=free. Writes=CHR fees. SDK=postchain-client. CLI=chr. " +
-    "People: Henrik Hjelte(CEO), Alex Mizrahi(CTO), Or Perelman(Co-founder). " +
-    "Games: My Neighbor Alice, Mines of Dalarnia.";
+val DEFAULT_CHROMIA_FACTS = "Chromia: L1 relational blockchain, PostgreSQL, Rell lang compiles to SQL, eBFT consensus 1s blocks, CHR token, FT4 standard, each dApp own chain, ICMF cross-chain, queries free, by ChromaWay Sweden 2014, Henrik Hjelte CEO, Alex Mizrahi CTO, Or Perelman Co-founder";
 
 val DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct";
 
@@ -60,12 +53,12 @@ function get_knowledge(): text {
 function get_system_prompt(mode: text): text {
     val facts = get_knowledge();
     val base = when (mode) {
-        "concise" -> "AI on Chromia. 1-3 sentences MAX. Direct. ";
-        "detailed" -> "AI on Chromia. Thorough with sections and examples. ";
-        "technical" -> "Technical AI on Chromia. Precise terminology. ";
-        "creative" -> "Creative AI on Chromia. Engaging and vivid. ";
-        "code" -> "Coding AI on Chromia. Working code + brief explanation. ";
-        else -> "AI on Chromia blockchain. Accurate, clear, 2-4 sentences. ";
+        "concise" -> "Brief. 1-2 sentences. ";
+        "detailed" -> "Thorough. ";
+        "technical" -> "Technical. ";
+        "creative" -> "Creative. ";
+        "code" -> "Code. ";
+        else -> "Clear, 2-3 sentences. ";
     };
     return base + facts;
 }

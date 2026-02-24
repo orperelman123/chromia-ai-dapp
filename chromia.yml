@@ -13,7 +13,7 @@ blockchains:
         model: "Qwen/Qwen2.5-1.5B-Instruct"
         inference_timeout_seconds: 60
         verification_timeout_seconds: 3
-        max_completion_tokens: 256
+        max_completion_tokens: 128
 
 compile:
   rellVersion: 0.14.15
