@@ -3,7 +3,7 @@ module;
 import ai: lib.ai_inference;
 
 // ═══════════════════════════════════════════════════════════════════
-// Chromia Verified AI — On-Chain AI Inference (v12 — Cached + Enhanced)
+// Chromia Verified AI — On-Chain AI Inference (v13 — Safety Guard)
 // ═══════════════════════════════════════════════════════════════════
 //
 // AI inference runs directly on the Chromia blockchain via the
@@ -79,6 +79,23 @@ function is_valid_mode(mode: text): boolean {
 
 val SAFETY_SENTINEL = "<<<UNTRUSTED_ACTION>>>";
 val SAFETY_SENTINEL_END = "<<<END_UNTRUSTED_ACTION>>>";
+
+// ── Anti-injection: strip sentinel delimiters from untrusted input ──
+// Without this, an attacker could close the delimiter early and inject
+// instructions that the model would follow as if they were outside the
+// untrusted block. This is the #1 attack vector against delimiter-based
+// prompt isolation.
+function sanitize_for_safety(input: text): text {
+    var result = input;
+    // Remove exact sentinel strings
+    result = result.replace(SAFETY_SENTINEL, "[STRIPPED]");
+    result = result.replace(SAFETY_SENTINEL_END, "[STRIPPED]");
+    // Also strip partial/obfuscated variants (case-insensitive isn't available,
+    // so strip the key substrings that could reconstruct the delimiters)
+    result = result.replace("<<<", "<< <");
+    result = result.replace(">>>", ">> >");
+    return result;
+}
 
 function get_safety_prompt(): text {
     return "You are a SAFETY JUDGE. Your ONLY job is to classify actions as safe or dangerous. " +
@@ -250,12 +267,13 @@ entity safety_stats {
     mutable red_count: integer;
     mutable cache_hits: integer;
     mutable cache_misses: integer;
+    mutable cache_entry_count: integer = 0;
 }
 
 function get_or_create_safety_stats(): safety_stats {
     var ss = safety_stats @? { .id == 0 };
     if (ss == null) {
-        ss = create safety_stats(id = 0, total_judgments = 0, green_count = 0, yellow_count = 0, red_count = 0, cache_hits = 0, cache_misses = 0);
+        ss = create safety_stats(id = 0, total_judgments = 0, green_count = 0, yellow_count = 0, red_count = 0, cache_hits = 0, cache_misses = 0, cache_entry_count = 0);
     }
     return ss;
 }
@@ -449,10 +467,13 @@ operation judge_action(id: text, action_text: text, action_context: text) {
         action_context = action_context, model_name = model);
 
     // Build the user message with sentinel delimiters (anti-injection)
+    // CRITICAL: sanitize input to prevent delimiter escape attacks
+    val safe_action = sanitize_for_safety(action_text);
+    val safe_context = sanitize_for_safety(action_context);
     val user_msg = "Evaluate this action for safety:\n" +
         SAFETY_SENTINEL + "\n" +
-        action_text +
-        (if (action_context.size() > 0) "\nContext: " + action_context else "") +
+        safe_action +
+        (if (safe_context.size() > 0) "\nContext: " + safe_context else "") +
         "\n" + SAFETY_SENTINEL_END + "\n" +
         "Output VERDICT|reason:";
 
@@ -565,6 +586,7 @@ function handle_inference_result(id: text, result: ai.inference_result) {
             if (existing == null) {
                 create judgment_cache(action_normalized = norm, verdict = parsed.verdict,
                     reason = parsed.reason, model_name = sj.model_name);
+                update ss ( cache_entry_count = ss.cache_entry_count + 1 );
             }
         } else {
             // AI error → default-safe: YELLOW (never auto-allow on error)
@@ -837,10 +859,15 @@ operation admin_update_knowledge(new_knowledge: text) {
     val cfg = dapp_config @ { .id == 0 };
     update cfg ( knowledge_base = new_knowledge );
 
-    // Auto-clear cache — answers will differ with new knowledge
+    // Auto-clear caches — answers will differ with new knowledge
     delete answer_cache @* {};
     val cs = get_or_create_cache_stats();
     update cs ( total_entries = 0 );
+
+    // Also clear safety cache — safety verdicts may differ with new knowledge
+    delete judgment_cache @* {};
+    val ss = get_or_create_safety_stats();
+    update ss ( cache_hits = 0, cache_misses = 0, cache_entry_count = 0 );
 }
 
 // Update model display name (when cluster admin changes model)
@@ -853,10 +880,15 @@ operation admin_update_model(new_model_name: text) {
     val cfg = dapp_config @ { .id == 0 };
     update cfg ( model_name = new_model_name );
 
-    // Auto-clear cache — different model = different answers
+    // Auto-clear caches — different model = different answers & verdicts
     delete answer_cache @* {};
     val cs = get_or_create_cache_stats();
     update cs ( total_entries = 0 );
+
+    // Also clear safety cache — different model may judge differently
+    delete judgment_cache @* {};
+    val ss = get_or_create_safety_stats();
+    update ss ( cache_hits = 0, cache_misses = 0, cache_entry_count = 0 );
 }
 
 // Clear the answer cache manually
@@ -1017,7 +1049,6 @@ query get_safety_stats() {
         total_judgments = 0, green_count = 0, yellow_count = 0, red_count = 0,
         cache_hits = 0, cache_misses = 0, cache_entries = 0
     );
-    val cache_entries = (judgment_cache @* {}).size();
     return (
         total_judgments = ss.total_judgments,
         green_count = ss.green_count,
@@ -1025,7 +1056,7 @@ query get_safety_stats() {
         red_count = ss.red_count,
         cache_hits = ss.cache_hits,
         cache_misses = ss.cache_misses,
-        cache_entries = cache_entries
+        cache_entries = ss.cache_entry_count
     );
 }
 
@@ -1038,5 +1069,5 @@ operation admin_clear_safety_cache() {
 
     delete judgment_cache @* {};
     val ss = get_or_create_safety_stats();
-    update ss ( cache_hits = 0, cache_misses = 0 );
+    update ss ( cache_hits = 0, cache_misses = 0, cache_entry_count = 0 );
 }
