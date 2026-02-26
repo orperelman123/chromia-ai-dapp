@@ -1,12 +1,17 @@
 blockchains:
-  verified_ai_v11:
+  verified_ai_v16:
     module: main
     config:
+      features:
+        merkle_hash_version: 2
       sync_ext:
         - "net.postchain.hybridcompute.HybridComputeSynchronizationInfrastructureExtension"
       gtx:
         modules:
           - "net.postchain.hybridcompute.HybridComputeGTXModule"
+          - "net.postchain.d1.iccf.IccfGTXModule"
+      blockstrategy:
+        maxblocktime: 2000
       hybridcompute:
         engine: "net.postchain.gtx.extensions.ai_inference.AiInferenceComputeEngine"
       ai_inference:
@@ -14,18 +19,34 @@ blockchains:
         inference_timeout_seconds: 60
         verification_timeout_seconds: 3
         max_completion_tokens: 128
+    moduleArgs:
+      lib.ft4.core.auth:
+        evm_signatures_authorized_operations:
+          - register_account
+      lib.ft4.core.accounts:
+        rate_limit:
+          active: false
+          max_points: 10
+          recovery_time: 5000
+          points_at_account_creation: 1
+      main:
+        admin_pubkey: x"02EAF3FAD870778854E397E6F6AAB1FC278E09A16F4DD940D68B62CC5416C3F906"
 
 compile:
   rellVersion: 0.14.15
 
 database:
-  schema: schema_verified_ai_v11
+  schema: schema_verified_ai_v16
 
 libs:
   com.chromia.hybridcompute:
     version: 3.35.4
   com.chromia.ai_inference:
     version: 0.4.0
+  com.chromia.ft4:
+    version: 1.1.0
+  com.chromia.iccf:
+    version: 1.90.2
 
 # ─── Deployment ────────────────────────────────────────────────
 deployments:
@@ -34,4 +55,4 @@ deployments:
     url: https://node0.testnet.chromia.com:7740
     container: 7675ac10e0861f4cb2b43ecc3f4302131377755f460674a4bfd03146e64dd1f9
     chains:
-      verified_ai_v11: x"42D870B056261B781F52FA178F95B8FE0513EDD5044A236F845844C859CAE3E6"
+      verified_ai_v16: x"633EE395FFE3B6FE6E9112A6E0523BAA15495AD01FE26AB617F7EF79C8E17446"

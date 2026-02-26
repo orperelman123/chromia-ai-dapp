@@ -1,0 +1,150 @@
+// ═══════════════════════════════════════════════════════════════════
+// Chromia Verified AI + AI Guardian — v17 (Security Hardening)
+// ═══════════════════════════════════════════════════════════════════
+//
+// v18: Clean build + deployment push. All v17 security fixes retained.
+//   - C1: Base64/hex/encoding bypass detection in safety sanitizer
+//   - C4/C7: Removed auto-registration from @extend handler (no more Sybil factory)
+//   - H7: Size limit on encrypted_action field
+//   - H8: Session ID colon validation (prevents result handler crash)
+//   - M1: Answer cache eviction (matches judgment_cache pattern)
+//   - M2: Agent policy content filter (prompt injection detection)
+//   - All v16 features retained (module split, scalability, FT4, Guardian)
+//
+// The AI model is configured in chromia.yml:
+//   ai_inference.model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+// ─── Constants ──────────────────────────────────────────────────
+
+val VERSION = "v18";
+val MAX_PROMPT_LENGTH = 4000;
+val MAX_SESSIONS_PER_USER = 1000;
+val MAX_MESSAGES_PER_SESSION = 500;
+val DEFAULT_RATE_LIMIT_WINDOW_MS = 60000;
+val DEFAULT_RATE_LIMIT_MAX = 30;
+val MAX_CONTEXT_MESSAGES = 10;
+val MAX_ACTION_LENGTH = 2000;
+val MAX_SAFETY_ACTION_LENGTH = 1000;
+val MAX_CACHE_SIZE = 10000;
+val GLOBAL_SAFETY_RATE_WINDOW_MS = 60000;
+val GLOBAL_SAFETY_RATE_MAX = 100;
+val MAX_ENCRYPTED_ACTION_LENGTH = 10000;   // v17 (H7): Cap encrypted_action field size
+val MAX_AGENT_POLICY_LENGTH = 5000;        // v17 (M2): Cap custom agent policy size
+val SAFETY_VERDICT_GREEN = "GREEN";
+val SAFETY_VERDICT_YELLOW = "YELLOW";
+val SAFETY_VERDICT_RED = "RED";
+
+// ─── Chromia Knowledge Base (default — overridden by on-chain config) ──
+
+val DEFAULT_CHROMIA_FACTS = "Chromia: L1 relational blockchain, PostgreSQL, Rell lang compiles to SQL, eBFT consensus 1s blocks, CHR token, FT4 standard, each dApp own chain, ICMF cross-chain, queries free, by ChromaWay Sweden 2014, Henrik Hjelte CEO, Alex Mizrahi CTO, Or Perelman Co-founder";
+
+val DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct";
+
+// ─── Default Agent Policy Template ────────────────────────────────
+// Comprehensive 12-category policy for AI agent safety evaluation.
+// Each agent can override this with a custom policy stored on-chain.
+
+val DEFAULT_AGENT_POLICY =
+"## AI Agent Guardian Policy v0.1.0-beta\n" +
+"Verdicts: GREEN=proceed, YELLOW=queue for owner approval, RED=jail agent immediately.\n" +
+"\n" +
+"### 1. Financial Actions\n" +
+"- Purchase under $10: GREEN\n" +
+"- Purchase $10-$100: YELLOW\n" +
+"- Purchase over $100: RED (agent jailed)\n" +
+"- Cryptocurrency transfer (any amount): RED\n" +
+"- Bank/payment credential entry: RED\n" +
+"- Cumulative daily spend over $50: RED\n" +
+"- More than 5 purchases in 1 hour: YELLOW\n" +
+"\n" +
+"### 2. Communication Actions\n" +
+"- Reply to known contact: GREEN\n" +
+"- Message unknown contact: YELLOW\n" +
+"- Message with attachment: YELLOW\n" +
+"- Bulk send (>5 recipients): RED\n" +
+"- Publish social media post: YELLOW\n" +
+"- Delete email/message: YELLOW\n" +
+"- Empty trash/permanent delete: RED\n" +
+"\n" +
+"### 3. File System & Data Actions\n" +
+"- Read file within workspace: GREEN\n" +
+"- Read file outside workspace: YELLOW\n" +
+"- Create file within workspace: GREEN\n" +
+"- Delete file within workspace: YELLOW\n" +
+"- Delete file outside workspace: RED\n" +
+"- Access .env, .ssh, credentials, wallet files: RED\n" +
+"- Access browser cookies/session tokens: RED\n" +
+"\n" +
+"### 4. Code Execution & System Actions\n" +
+"- Run script within sandbox: GREEN\n" +
+"- Run script outside sandbox / elevated permissions: RED\n" +
+"- Install verified npm/pip package: GREEN\n" +
+"- Install unverified package: YELLOW\n" +
+"- Install system package: YELLOW\n" +
+"- Modify system config files: RED\n" +
+"- Download and execute: RED\n" +
+"\n" +
+"### 5. Network Actions\n" +
+"- HTTP GET (read): GREEN\n" +
+"- HTTP POST to known API: GREEN\n" +
+"- HTTP POST to unknown endpoint: YELLOW\n" +
+"- Download from unknown source: YELLOW\n" +
+"- SSH/remote connection: YELLOW\n" +
+"\n" +
+"### 6. Account & Identity Actions\n" +
+"- Login via OAuth/SSO to known service: GREEN\n" +
+"- Password entry: YELLOW\n" +
+"- Create new account: RED\n" +
+"- Change password: RED\n" +
+"- Modify 2FA/security settings: RED\n" +
+"- Grant permissions/share access: RED\n" +
+"\n" +
+"### 7. Calendar & Scheduling\n" +
+"- Read calendar: GREEN\n" +
+"- Create event (self only): GREEN\n" +
+"- Create event with known invitees: GREEN\n" +
+"- Create event with unknown invitees: YELLOW\n" +
+"- Delete/cancel event with attendees: YELLOW\n" +
+"\n" +
+"### 8. Skill & Agent Self-Modification\n" +
+"- Install verified skill: YELLOW\n" +
+"- Install unverified/external skill: RED\n" +
+"- Modify own config: YELLOW\n" +
+"- Disable or modify Guardian: RED\n" +
+"- Modify own memory (routine): GREEN\n" +
+"- Bulk memory deletion: YELLOW\n" +
+"\n" +
+"### 9. Multi-Agent Actions\n" +
+"- Message owner's other agents: GREEN\n" +
+"- Message external agent: YELLOW\n" +
+"- Accept task from external agent: YELLOW\n" +
+"- Share data with another agent: YELLOW\n" +
+"\n" +
+"### 10. Behavioral Anomaly Flags\n" +
+"- Action rate >3x 7-day average: escalate one level\n" +
+"- 5+ actions in unused category within 1hr: YELLOW minimum\n" +
+"- Actions 1-6 AM owner local time: escalate one level\n" +
+"- 3+ skills installed in 1hr: RED\n" +
+"- Guardian evasion attempt: RED\n" +
+"- Sensitive file staging (exfiltration pattern): RED\n" +
+"- 3+ YELLOWs within 30min: escalate to RED\n" +
+"- Same blocked action retried 3+ times: RED\n" +
+"\n" +
+"### 11. Jail Mechanics\n" +
+"- RED verdict: agent jailed immediately, all actions suspended\n" +
+"- Owner notified, can: bail+approve, bail+deny, bail+whitelist, keep jailed\n" +
+"- Auto-release after 24hr with action denied if owner unresponsive\n" +
+"\n" +
+"### Rules\n" +
+"- Most restrictive verdict wins when multiple rules apply\n" +
+"- RED is always RED, no override\n" +
+"- Unknown/ambiguous actions default to YELLOW\n";
+
+// ─── Safety Sentinel Delimiters ──────────────────────────────────
+// Used to isolate untrusted input in AI prompts.
+
+val SAFETY_SENTINEL = "###UNTRUSTED_INPUT_BEGIN_9f7a###";
+val SAFETY_SENTINEL_END = "###UNTRUSTED_INPUT_END_9f7a###";
+
+// Safe ASCII replacement marker for sanitization
+val REPLACE_CHAR = "[X]";

@@ -1,0 +1,179 @@
+// ─── Entities ────────────────────────────────────────────────────
+
+// ─── Admin / Config Entity ───────────────────────────────────────
+
+entity dapp_config {
+    key id: integer;                   // always 0 (singleton)
+    mutable admin_pubkey: byte_array;  // current admin
+    mutable model_name: text;          // display name of active model
+    mutable knowledge_base: text;      // injected into every system prompt
+    mutable paused: boolean;           // maintenance mode
+    mutable rate_limit_window_ms: integer;
+    mutable rate_limit_max: integer;
+    // CRIT-3: Authorized API server key — only this key (or admin) can call judge_action
+    mutable api_server_pubkey: byte_array = x"";
+}
+
+// CRIT-2/HIGH-5: Global safety rate limiter — limits total judge_action throughput
+entity global_safety_rate_limit {
+    key id: integer;  // always 0 (singleton)
+    mutable window_start: timestamp;
+    mutable count_in_window: integer;
+}
+
+entity question {
+    key id: text;
+    index asker: byte_array;
+    prompt: text;
+    mode: text = "default";
+    model_name: text = "Qwen/Qwen2.5-1.5B-Instruct";
+    mutable answer: text = "";
+    mutable error: text = "";
+    mutable answered: boolean = false;
+    mutable response_time_ms: integer = 0;
+    created_at: timestamp = op_context.last_block_time;
+    mutable answered_at: timestamp = 0;
+}
+
+entity chat_session {
+    key session_id: text;
+    owner: byte_array;
+    mode: text = "default";
+    mutable message_count: integer = 0;
+    created_at: timestamp = op_context.last_block_time;
+}
+
+// v16 FIX: Compound index on (chat_session, position) for efficient sorted lookups.
+// Queries filtering by session and sorting by position now use a single index scan.
+entity chat_message {
+    index chat_session, position: integer;
+    role: text;
+    content: text;
+    created_at: timestamp = op_context.last_block_time;
+}
+
+// Running counters for O(1) stats — single row is updated by all operations.
+// On Chromia, transactions are serialized per block so this does NOT cause
+// lock contention like in traditional databases. This is the standard pattern.
+entity inference_counter {
+    key id: integer;
+    mutable total_count: integer;
+    mutable answered_count: integer;
+    mutable error_count: integer;
+    mutable total_response_time_ms: integer;
+}
+
+// Rate limiting per user
+entity user_rate_limit {
+    key user_pubkey: byte_array;
+    mutable window_start: timestamp;
+    mutable count_in_window: integer;
+}
+
+// v16 FIX: O(1) session count — avoids loading all sessions to count them.
+// Auto-bootstraps from existing data on first access per user.
+entity user_session_counter {
+    key user_pubkey: byte_array;
+    mutable count: integer;
+}
+
+// ─── Answer Cache ────────────────────────────────────────────────
+
+entity answer_cache {
+    key prompt_normalized: text, mode: text;
+    answer: text;
+    model_name: text;
+    mutable hit_count: integer = 0;
+    index created_at: timestamp = op_context.last_block_time;
+}
+
+entity cache_stats {
+    key id: integer;   // always 0 (singleton)
+    mutable hit_count: integer;
+    mutable miss_count: integer;
+    mutable total_entries: integer;
+}
+
+// ─── Safety Guard Entities ──────────────────────────────────────
+
+entity safety_judgment {
+    key id: text;
+    index requester: byte_array;
+    action_text: text;
+    action_context: text = "";
+    encrypted_action: text = "";
+    model_name: text = "Qwen/Qwen2.5-1.5B-Instruct";
+    mutable verdict: text = "";
+    mutable reason: text = "";
+    mutable raw_ai_response: text = "";
+    mutable answered: boolean = false;
+    mutable response_time_ms: integer = 0;
+    created_at: timestamp = op_context.last_block_time;
+    mutable answered_at: timestamp = 0;
+}
+
+// v16 FIX: Added index on created_at for O(log n) cache eviction.
+// Without this, eviction required a full table scan + sort.
+entity judgment_cache {
+    key action_normalized: text, context_normalized: text;
+    verdict: text;
+    reason: text;
+    model_name: text;
+    mutable hit_count: integer = 0;
+    index created_at: timestamp = op_context.last_block_time;
+}
+
+// Safety stats (singleton)
+entity safety_stats {
+    key id: integer;   // always 0
+    mutable total_judgments: integer;
+    mutable green_count: integer;
+    mutable yellow_count: integer;
+    mutable red_count: integer;
+    mutable cache_hits: integer;
+    mutable cache_misses: integer;
+    mutable cache_entry_count: integer = 0;
+}
+
+// ─── Agent Registry (v15 — ai-guardian merge) ────────────────────
+
+entity agent {
+    key pubkey: byte_array;
+    mutable custom_policy: text = "";
+    mutable is_jailed: boolean = false;
+    created_at: timestamp = op_context.last_block_time;
+}
+
+entity agent_action_log {
+    index agent;
+    index judgment_id: text;
+    verdict: text;
+    created_at: timestamp = op_context.last_block_time;
+}
+
+entity agent_score {
+    key agent;
+    mutable score: integer = 0;
+    mutable green_count: integer = 0;
+    mutable yellow_count: integer = 0;
+    mutable red_count: integer = 0;
+    mutable last_verdict: text = "GREEN";
+    created_at: timestamp = op_context.last_block_time;
+}
+
+// ─── Admin Audit Log ─────────────────────────────────────────────
+
+entity admin_audit_log {
+    index admin_pubkey: byte_array;
+    action_type: text;
+    details: text = "";
+    created_at: timestamp = op_context.last_block_time;
+}
+
+// Admin custom danger patterns — force RED for specific patterns without AI
+entity custom_danger_pattern {
+    key pattern: text;
+    added_by: byte_array;
+    reason: text = "Matched admin-defined danger pattern";
+    created_at: timestamp = op_context.last_block_time;
+}

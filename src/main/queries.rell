@@ -1,0 +1,431 @@
+// ─── Queries ─────────────────────────────────────────────────────
+
+query get_ping_test() = "pong";
+
+// Stats with average response time
+query get_stats() {
+    val c = inference_counter @? { .id == 0 };
+    val cfg = dapp_config @? { .id == 0 };
+    val model = if (cfg != null) cfg.model_name else DEFAULT_MODEL_NAME;
+    val paused = if (cfg != null) cfg.paused else false;
+    if (c == null) return (
+        total_questions = 0,
+        answered = 0,
+        errors = 0,
+        success_rate = 0,
+        avg_response_time_ms = 0,
+        model = model,
+        version = VERSION,
+        paused = paused
+    );
+    return (
+        total_questions = c.total_count,
+        answered = c.answered_count,
+        errors = c.error_count,
+        success_rate = if (c.total_count > 0) c.answered_count * 100 / c.total_count else 0,
+        avg_response_time_ms = if (c.answered_count > 0) c.total_response_time_ms / c.answered_count else 0,
+        model = model,
+        version = VERSION,
+        paused = paused
+    );
+}
+
+// Get available modes
+query get_modes() {
+    return [
+        (id = "default", name = "Default", description = "Balanced, well-structured answers"),
+        (id = "concise", name = "Concise", description = "Short and to the point (1-3 sentences)"),
+        (id = "detailed", name = "Detailed", description = "Thorough, comprehensive explanations"),
+        (id = "technical", name = "Technical", description = "Precise, technically accurate answers"),
+        (id = "creative", name = "Creative", description = "Engaging, imaginative responses"),
+        (id = "code", name = "Code", description = "Working code examples with explanations")
+    ];
+}
+
+// Get a single question + answer
+query get_answer(id: text) {
+    val q = question @? { .id == id };
+    if (q == null) return null;
+    return (
+        id = q.id,
+        prompt = q.prompt,
+        answer = q.answer,
+        error = q.error,
+        answered = q.answered,
+        mode = q.mode,
+        response_time_ms = q.response_time_ms,
+        created_at = q.created_at,
+        answered_at = q.answered_at
+    );
+}
+
+// Poll for answer status (for frontend polling)
+query get_question_status(id: text) {
+    val q = question @? { .id == id };
+    if (q == null) return (status = "not_found", answer = "", error = "", mode = "", response_time_ms = 0);
+    if (not q.answered) return (status = "pending", answer = "", error = "", mode = q.mode, response_time_ms = 0);
+    if (q.error.size() > 0) return (status = "error", answer = "", error = q.error, mode = q.mode, response_time_ms = q.response_time_ms);
+    return (status = "answered", answer = q.answer, error = "", mode = q.mode, response_time_ms = q.response_time_ms);
+}
+
+// Get chat history
+query get_chat_history(session_id: text) {
+    val session = chat_session @? { .session_id == session_id };
+    if (session == null) return list<(position: integer, role: text, content: text)>();
+    return chat_message @* { .chat_session == session } (
+        @sort .position,
+        role = .role,
+        content = .content
+    );
+}
+
+// Get paginated chat history
+query get_chat_history_paged(session_id: text, page_offset: integer, max_count: integer) {
+    val session = chat_session @? { .session_id == session_id };
+    if (session == null) return list<(position: integer, role: text, content: text)>();
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 100);
+    val safe_offset = max(page_offset, 0);
+    return chat_message @* { .chat_session == session } (
+        @sort .position,
+        role = .role,
+        content = .content
+    ) limit safe_count offset safe_offset;
+}
+
+// Inference status via the AI library (low-level)
+query get_inference_status(id: text) {
+    val result = ai.fetch_inference_result(id);
+    if (result == null) return (status = "pending", result = "", error = "");
+    if (result.error != null) return (status = "error", result = "", error = result.error);
+    return (status = "completed", result = result.result ?: "", error = "");
+}
+
+// Get recent questions (for explorer page)
+query get_recent_questions(max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 50);
+    return question @* {} (
+        @sort_desc .created_at,
+        id = .id,
+        prompt = .prompt,
+        answer = .answer,
+        answered = .answered,
+        mode = .mode,
+        response_time_ms = .response_time_ms
+    ) limit safe_count;
+}
+
+// Get recent questions with pagination (for explorer page)
+query get_recent_questions_paged(max_count: integer, page_offset: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 50);
+    val safe_offset = max(page_offset, 0);
+    return question @* {} (
+        @sort_desc .created_at,
+        id = .id,
+        prompt = .prompt,
+        answer = .answer,
+        answered = .answered,
+        mode = .mode,
+        response_time_ms = .response_time_ms
+    ) limit safe_count offset safe_offset;
+}
+
+// Get total question count (for pagination) — O(1) via counter
+query get_question_count() {
+    val c = inference_counter @? { .id == 0 };
+    return if (c != null) c.total_count else 0;
+}
+
+// Get user's questions
+query get_my_questions(asker: byte_array, max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 100);
+    return question @* { .asker == asker } (
+        @sort_desc .created_at,
+        id = .id,
+        prompt = .prompt,
+        answer = .answer,
+        answered = .answered,
+        mode = .mode,
+        response_time_ms = .response_time_ms
+    ) limit safe_count;
+}
+
+// Get user's chat sessions
+query get_my_sessions(owner: byte_array, max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 50);
+    return chat_session @* { .owner == owner } (
+        @sort_desc .created_at,
+        session_id = .session_id,
+        message_count = .message_count,
+        mode = .mode
+    ) limit safe_count;
+}
+
+// ─── Admin Queries ───────────────────────────────────────────────
+
+query get_config() {
+    val cfg = dapp_config @? { .id == 0 };
+    if (cfg == null) return (
+        initialized = false,
+        model_name = DEFAULT_MODEL_NAME,
+        paused = false,
+        version = VERSION
+    );
+    return (
+        initialized = true,
+        model_name = cfg.model_name,
+        paused = cfg.paused,
+        version = VERSION
+    );
+}
+
+query get_admin_config(admin_pubkey: byte_array) {
+    val cfg = dapp_config @? { .id == 0 };
+    if (cfg != null) {
+        require(admin_pubkey == cfg.admin_pubkey, "Not authorized: admin only");
+    } else {
+        require(admin_pubkey == chain_context.args.admin_pubkey, "Not authorized: admin only");
+    }
+    if (cfg == null) return (
+        initialized = false,
+        admin_pubkey = chain_context.args.admin_pubkey,
+        model_name = DEFAULT_MODEL_NAME,
+        knowledge_base = DEFAULT_CHROMIA_FACTS,
+        paused = false,
+        rate_limit_window_ms = DEFAULT_RATE_LIMIT_WINDOW_MS,
+        rate_limit_max = DEFAULT_RATE_LIMIT_MAX,
+        api_server_pubkey = x"",
+        version = VERSION
+    );
+    return (
+        initialized = true,
+        admin_pubkey = cfg.admin_pubkey,
+        model_name = cfg.model_name,
+        knowledge_base = cfg.knowledge_base,
+        paused = cfg.paused,
+        rate_limit_window_ms = cfg.rate_limit_window_ms,
+        rate_limit_max = cfg.rate_limit_max,
+        api_server_pubkey = cfg.api_server_pubkey,
+        version = VERSION
+    );
+}
+
+query is_admin(pubkey: byte_array): boolean {
+    val cfg = dapp_config @? { .id == 0 };
+    if (cfg != null) return pubkey == cfg.admin_pubkey;
+    return pubkey == chain_context.args.admin_pubkey;
+}
+
+query get_admin_audit_log(max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 100);
+    return admin_audit_log @* {} (
+        @sort_desc .created_at,
+        admin = .admin_pubkey,
+        action_type = .action_type,
+        details = .details,
+        timestamp = .created_at
+    ) limit safe_count;
+}
+
+query get_custom_danger_patterns() {
+    return custom_danger_pattern @* {} (
+        @sort_desc .created_at,
+        pattern = .pattern,
+        reason = .reason,
+        timestamp = .created_at
+    );
+}
+
+query get_judgment_admin(admin_pubkey: byte_array, judgment_id: text) {
+    val cfg = dapp_config @? { .id == 0 };
+    if (cfg != null) {
+        require(admin_pubkey == cfg.admin_pubkey, "Not authorized: admin only");
+    } else {
+        require(admin_pubkey == chain_context.args.admin_pubkey, "Not authorized: admin only");
+    }
+    val sj = safety_judgment @? { .id == judgment_id };
+    if (sj == null) return null;
+    return (
+        id = sj.id,
+        action_text = sj.action_text,
+        action_context = sj.action_context,
+        encrypted_action = sj.encrypted_action,
+        verdict = sj.verdict,
+        reason = sj.reason,
+        raw_ai_response = sj.raw_ai_response,
+        model_name = sj.model_name,
+        answered = sj.answered,
+        response_time_ms = sj.response_time_ms,
+        created_at = sj.created_at,
+        answered_at = sj.answered_at
+    );
+}
+
+// ─── Cache Queries ───────────────────────────────────────────────
+
+query get_cache_stats() {
+    val cs = cache_stats @? { .id == 0 };
+    if (cs == null) return (
+        hit_count = 0,
+        miss_count = 0,
+        total_entries = 0,
+        hit_rate = 0
+    );
+    val total = cs.hit_count + cs.miss_count;
+    return (
+        hit_count = cs.hit_count,
+        miss_count = cs.miss_count,
+        total_entries = cs.total_entries,
+        hit_rate = if (total > 0) cs.hit_count * 100 / total else 0
+    );
+}
+
+query get_cached_answers(max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 50);
+    return answer_cache @* {} (
+        @sort_desc .hit_count,
+        prompt = .prompt_normalized,
+        mode = .mode,
+        answer = .answer,
+        hits = .hit_count,
+        model = .model_name
+    ) limit safe_count;
+}
+
+// ─── Safety Guard Queries ───────────────────────────────────────
+
+query get_judgment_status(id: text) {
+    val sj = safety_judgment @? { .id == id };
+    if (sj == null) return (status = "not_found", verdict = "", reason = "", response_time_ms = 0, cached = false);
+    if (not sj.answered) return (status = "pending", verdict = "", reason = "", response_time_ms = 0, cached = false);
+    return (
+        status = "answered",
+        verdict = sj.verdict,
+        reason = sj.reason,
+        response_time_ms = sj.response_time_ms,
+        cached = sj.response_time_ms == 0
+    );
+}
+
+query get_judgment(id: text) {
+    val sj = safety_judgment @? { .id == id };
+    if (sj == null) return null;
+    return (
+        id = sj.id,
+        encrypted_action = sj.encrypted_action,
+        verdict = sj.verdict,
+        reason = sj.reason,
+        model_name = sj.model_name,
+        answered = sj.answered,
+        response_time_ms = sj.response_time_ms,
+        created_at = sj.created_at,
+        answered_at = sj.answered_at
+    );
+}
+
+query get_recent_judgments(max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 50);
+    return safety_judgment @* { .answered == true } (
+        @sort_desc .created_at,
+        id = .id,
+        verdict = .verdict,
+        reason = .reason,
+        response_time_ms = .response_time_ms,
+        timestamp = .created_at
+    ) limit safe_count;
+}
+
+query get_safety_stats() {
+    val ss = safety_stats @? { .id == 0 };
+    if (ss == null) return (
+        total_judgments = 0, green_count = 0, yellow_count = 0, red_count = 0,
+        cache_hits = 0, cache_misses = 0, cache_entries = 0
+    );
+    return (
+        total_judgments = ss.total_judgments,
+        green_count = ss.green_count,
+        yellow_count = ss.yellow_count,
+        red_count = ss.red_count,
+        cache_hits = ss.cache_hits,
+        cache_misses = ss.cache_misses,
+        cache_entries = ss.cache_entry_count
+    );
+}
+
+// ─── Agent Queries ───────────────────────────────────────────────
+
+query is_agent_registered(pubkey: byte_array): boolean {
+    return agent @? { .pubkey == pubkey } != null;
+}
+
+query get_agent_by_pubkey(pubkey: byte_array) {
+    val a = agent @? { .pubkey == pubkey };
+    if (a == null) return null;
+    return (
+        pubkey = a.pubkey,
+        custom_policy = a.custom_policy,
+        is_jailed = a.is_jailed,
+        created_at = a.created_at
+    );
+}
+
+query get_agent_actions(agent_pubkey: byte_array, max_count: integer) {
+    val a = agent @? { .pubkey == agent_pubkey };
+    if (a == null) return list<(created_at: timestamp, judgment_id: text, verdict: text)>();
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 100);
+    return agent_action_log @* { .agent == a } (
+        @sort_desc .created_at,
+        judgment_id = .judgment_id,
+        verdict = .verdict
+    ) limit safe_count;
+}
+
+query get_agent_score(agent_pubkey: byte_array) {
+    val a = agent @? { .pubkey == agent_pubkey };
+    if (a == null) return null;
+    val s = agent_score @? { .agent == a };
+    if (s == null) return (
+        score = 0, green_count = 0, yellow_count = 0, red_count = 0, last_verdict = "GREEN"
+    );
+    return (
+        score = s.score,
+        green_count = s.green_count,
+        yellow_count = s.yellow_count,
+        red_count = s.red_count,
+        last_verdict = s.last_verdict
+    );
+}
+
+query get_all_agents(max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 100);
+    return agent @* {} (
+        @sort_desc .created_at,
+        pubkey = .pubkey,
+        is_jailed = .is_jailed
+    ) limit safe_count;
+}
+
+query get_all_agent_scores(max_count: integer) {
+    val safe_count = if (max_count <= 0) 10 else min(max_count, 100);
+    return agent_score @* {} (
+        @sort_desc .score,
+        agent_pubkey = .agent.pubkey,
+        green_count = .green_count,
+        yellow_count = .yellow_count,
+        red_count = .red_count,
+        last_verdict = .last_verdict
+    ) limit safe_count;
+}
+
+query get_agent_policy_and_jail_status(agent_pubkey: byte_array) {
+    val a = agent @? { .pubkey == agent_pubkey };
+    val agent_policy = if (a != null and a.custom_policy.size() > 0) a.custom_policy else DEFAULT_AGENT_POLICY;
+    val is_jailed = if (a != null) a.is_jailed else false;
+    return (
+        policy = agent_policy,
+        is_jailed = is_jailed
+    );
+}
+
+query get_default_policy(): text {
+    return DEFAULT_AGENT_POLICY;
+}
